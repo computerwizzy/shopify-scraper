@@ -64,6 +64,10 @@ async function scrapeShopifyStore(baseUrl, logger = console.log, mode = 'shopify
             const result = await handleShopifyScrape(baseUrl, mode, logger);
             products = result.products;
             collections = result.collections;
+        } else if (mode === 'shopify_browser' || mode === 'shopify_browser_collection') {
+            const result = await handleShopifyBrowserScrape(baseUrl, mode, logger);
+            products = result.products;
+            collections = result.collections;
         } else if (mode === 'woocommerce') {
             products = await handleWooCommerceScrape(baseUrl, logger);
         } else if (mode === 'customwheeloffset') {
@@ -151,6 +155,109 @@ async function handleShopifyScrape(baseUrl, mode, logger) {
             logger(`  -> Finished (${err.response?.status || err.message})`);
             hasMore = false;
         }
+    }
+
+    return { products, collections };
+}
+
+/**
+ * Shopify scraper with Playwright browser to bypass Cloudflare WAF.
+ * Navigates the site in a real browser to pass the challenge, then uses
+ * fetch() from within the page context to access /products.json endpoints.
+ * Works with both full-store URLs and collection URLs.
+ */
+async function handleShopifyBrowserScrape(baseUrl, mode, logger) {
+    let chromium;
+    try { ({ chromium } = require('playwright')); }
+    catch {
+        logger('  -> playwright not installed. Run: npm install playwright && npx playwright install chromium');
+        return { products: [], collections: [] };
+    }
+
+    const urlObj = new URL(baseUrl);
+    const origin = urlObj.origin;
+    const isCollection = mode === 'shopify_browser_collection' || urlObj.pathname.length > 1;
+
+    logger('\n[1/3] Launching browser to bypass Cloudflare WAF...');
+    const headless = process.env.SHOPIFY_BROWSER_HEADLESS === 'true';
+    const browser = await chromium.launch({ headless });
+    const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1366, height: 768 }, locale: 'en-US' });
+
+    const products = [];
+    const collections = [];
+
+    try {
+        const page = await ctx.newPage();
+        logger(`  -> Navigating to ${baseUrl}`);
+        await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+        // Wait for Cloudflare challenge to clear
+        await page.waitForFunction(
+            () => !/just a moment/i.test(document.title) && document.readyState === 'complete',
+            { timeout: 30000 }
+        );
+        await page.waitForTimeout(2000);
+        logger('  -> Cloudflare bypass successful.');
+
+        // Fetch collections (full-store mode only)
+        if (!isCollection) {
+            logger('\n[2/3] Fetching collections...');
+            let colPage = 1;
+            let hasMore = true;
+            while (hasMore) {
+                const data = await page.evaluate(async (url) => {
+                    try { const r = await fetch(url); return r.ok ? r.json() : null; } catch { return null; }
+                }, `${origin}/collections.json?limit=250&page=${colPage}`);
+                if (data?.collections?.length > 0) {
+                    collections.push(...data.collections);
+                    logger(`  -> Fetched ${data.collections.length} collections (page ${colPage})`);
+                    colPage++;
+                } else { hasMore = false; }
+            }
+        } else {
+            logger('\n[2/3] Collection mode — skipping full collections fetch.');
+        }
+
+        // Determine products endpoint
+        // Collection URL: try {url}/products.json first, fall back to {origin}/products.json
+        const productsBase = isCollection ? baseUrl : origin;
+
+        logger('\n[3/3] Fetching products...');
+        let totalExpected = 0;
+        const countData = await page.evaluate(async (url) => {
+            try { const r = await fetch(url); return r.ok ? r.json() : null; } catch { return null; }
+        }, `${origin}/products/count.json`);
+        if (countData?.count) {
+            totalExpected = countData.count;
+            logger(`  (Total products in store: ${totalExpected})`);
+        }
+
+        const fetchPages = async (base) => {
+            let p = 1;
+            while (true) {
+                const data = await page.evaluate(async (url) => {
+                    try { const r = await fetch(url); return r.ok ? r.json() : null; } catch { return null; }
+                }, `${base}/products.json?limit=250&page=${p}`);
+                if (!data?.products?.length) break;
+                products.push(...data.products);
+                const msg = totalExpected
+                    ? `Fetched ${products.length}/${totalExpected} products...`
+                    : `Fetched ${products.length} products (page ${p})...`;
+                logger(`  -> ${msg}`);
+                p++;
+                await page.waitForTimeout(REQUEST_DELAY_MS);
+            }
+        };
+
+        await fetchPages(productsBase);
+
+        // If collection endpoint returned nothing, fall back to full store
+        if (products.length === 0 && isCollection) {
+            logger(`  -> Collection endpoint returned nothing, trying full store...`);
+            await fetchPages(origin);
+        }
+    } finally {
+        await browser.close();
     }
 
     return { products, collections };

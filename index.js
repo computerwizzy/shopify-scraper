@@ -69,13 +69,27 @@ async function scrapeShopifyStore(baseUrl, logger = console.log, mode = 'shopify
             products = result.products;
             collections = result.collections;
         } else if (mode === 'magento') {
-            products = await handleMagentoScrape(baseUrl, logger, options);
+            products = await handleJsonLdScrape(baseUrl, logger, options, { name: 'Magento', pageParam: 'p' });
+        } else if (mode === 'bigcommerce') {
+            products = await handleJsonLdScrape(baseUrl, logger, options, { name: 'BigCommerce', pageParam: 'page' });
+        } else if (mode === 'prestashop') {
+            products = await handleJsonLdScrape(baseUrl, logger, options, { name: 'PrestaShop', pageParam: 'p' });
+        } else if (mode === 'opencart') {
+            products = await handleJsonLdScrape(baseUrl, logger, options, { name: 'OpenCart', pageParam: 'page' });
+        } else if (mode === 'squarespace') {
+            products = await handleJsonLdScrape(baseUrl, logger, options, { name: 'Squarespace', pageParam: 'page' });
+        } else if (mode === 'nopcommerce') {
+            products = await handleJsonLdScrape(baseUrl, logger, options, { name: 'nopCommerce', pageParam: 'pagenumber' });
+        } else if (mode === 'ecwid') {
+            products = await handleEcwidScrape(baseUrl, logger, options);
         } else if (mode === 'woocommerce') {
             products = await handleWooCommerceScrape(baseUrl, logger);
         } else if (mode === 'customwheeloffset') {
             products = await handleCustomWheelOffsetScrape(baseUrl, logger, options);
         } else if (mode === 'forgiato') {
             products = await handleForgiatoScrape(baseUrl, logger, options);
+        } else if (mode === 'generic') {
+            products = await handleJsonLdScrape(baseUrl, logger, options, { name: 'Generic', pageParam: 'page' });
         } else {
             logger(`Mode [${mode}] not implemented. Falling back to Shopify.`);
             const result = await handleShopifyScrape(baseUrl, 'shopify', logger);
@@ -271,57 +285,83 @@ async function handleShopifyBrowserScrape(baseUrl, mode, logger) {
  * Pagination uses Magento's standard ?p=N query parameter.
  * Uses Playwright to bypass Cloudflare WAF if direct requests are blocked.
  */
-async function handleMagentoScrape(baseUrl, logger, options = {}) {
-    const maxPages = options.maxPages === 'auto' || !options.maxPages ? 500 : options.maxPages;
-    logger(`\n[1/1] Fetching Magento products via JSON-LD extraction...`);
+// ---------------------------------------------------------------------------
+// Shared JSON-LD engine — used by Magento, BigCommerce, PrestaShop, OpenCart,
+// Squarespace, nopCommerce, and the Generic fallback mode.
+// ---------------------------------------------------------------------------
 
-    // Try direct HTTP first; fall back to Playwright if blocked
-    const tryDirect = async (url) => {
-        try {
-            const res = await fetchWithRetry({
-                method: 'get', url,
-                headers: {
-                    'User-Agent': UA,
-                    'Accept': 'text/html,application/xhtml+xml',
-                    'Accept-Language': 'en-US,en;q=0.9'
-                },
-                timeout: 20000
-            });
-            return typeof res.data === 'string' ? res.data : null;
-        } catch { return null; }
+function buildPaginatedUrl(baseUrl, param, page) {
+    if (page === 1) return baseUrl;
+    const sep = baseUrl.includes('?') ? '&' : '?';
+    return `${baseUrl}${sep}${param}=${page}`;
+}
+
+async function quickDirectFetch(url) {
+    try {
+        const res = await axios.get(url, {
+            headers: { 'User-Agent': UA, 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' },
+            timeout: 15000
+        });
+        return typeof res.data === 'string' ? res.data : null;
+    } catch { return null; }
+}
+
+function normalizeGenericProduct(item, platformName = '') {
+    const url = item.url || '';
+    const slug = url.replace(/\/$/, '').split('/').pop()?.split('?')[0] || '';
+    const offer = item.offers || {};
+    const price = offer.price != null ? Number(offer.price).toFixed(2) : '';
+    const available = typeof offer.availability === 'string' ? /InStock/i.test(offer.availability) : true;
+    // Strip CDN image transforms (Cloudflare /cdn-cgi/image/..., Fastly, etc.)
+    const image = (item.image || '').replace(/\/cdn-cgi\/image\/[^/]+\//, '/');
+
+    return {
+        id: item.sku || item.mpn || slug,
+        title: item.name || slug,
+        handle: slug,
+        vendor: item.brand?.name || item.manufacturer || '',
+        product_type: item.category || platformName,
+        tags: [item.color, item.material, item.size].filter(Boolean).join(' | '),
+        images: image ? [{ src: image }] : [],
+        variants: [{ sku: item.sku || item.mpn || slug, price, compare_at_price: null, available }],
+        url
     };
+}
 
-    // Check if direct access works on page 1
-    const firstUrl = baseUrl.includes('?') ? `${baseUrl}&p=1` : `${baseUrl}?p=1`;
-    let html = await tryDirect(firstUrl);
-    const directBlocked = !html || !html.includes('ItemList');
+/**
+ * Shared JSON-LD scraper. Tries direct HTTP first; falls back to Playwright.
+ * config: { name, pageParam } — e.g. { name: 'Magento', pageParam: 'p' }
+ */
+async function handleJsonLdScrape(baseUrl, logger, options = {}, config = {}) {
+    const { name = 'Generic', pageParam = 'page' } = config;
+    const maxPages = (!options.maxPages || options.maxPages === 'auto') ? 500 : options.maxPages;
+    logger(`\n[1/1] Fetching ${name} products (JSON-LD extraction, param: ?${pageParam}=N)...`);
 
-    if (directBlocked) {
-        logger('  -> Direct request blocked or no JSON-LD found. Switching to browser mode...');
-        return await handleMagentoBrowserScrape(baseUrl, logger, maxPages);
+    const firstHtml = await quickDirectFetch(buildPaginatedUrl(baseUrl, pageParam, 1));
+    const hasData = firstHtml && (firstHtml.includes('"ItemList"') || firstHtml.includes('"@type":"Product"'));
+
+    if (!hasData) {
+        logger(`  -> Direct access blocked or no JSON-LD. Switching to browser...`);
+        return genericJsonLdBrowserScrape(baseUrl, logger, maxPages, pageParam, name);
     }
 
-    // Direct access works — paginate with axios
     const products = [];
     const seenUrls = new Set();
 
     for (let page = 1; page <= maxPages; page++) {
-        const pageUrl = baseUrl.includes('?') ? `${baseUrl}&p=${page}` : `${baseUrl}?p=${page}`;
-        if (page > 1) {
-            html = await tryDirect(pageUrl);
-            if (!html) { logger(`  -> Error on page ${page}. Stopping.`); break; }
-        }
+        const html = page === 1 ? firstHtml : await quickDirectFetch(buildPaginatedUrl(baseUrl, pageParam, page));
+        if (!html) { logger(`  -> Error on page ${page}. Stopping.`); break; }
 
         const items = extractItemListProducts(html);
         if (!items.length) { logger(`  -> No products on page ${page}. Stopping.`); break; }
 
         let newCount = 0;
         for (const item of items) {
-            const url = item.url || '';
-            if (url && seenUrls.has(url)) continue;
-            if (url) seenUrls.add(url);
+            const u = item.url || '';
+            if (u && seenUrls.has(u)) continue;
+            if (u) seenUrls.add(u);
             newCount++;
-            products.push(normalizeMagentoProduct(item));
+            products.push(normalizeGenericProduct(item, name));
         }
 
         logger(`  -> Page ${page}: ${items.length} items (${newCount} new). Total: ${products.length}`);
@@ -332,7 +372,7 @@ async function handleMagentoScrape(baseUrl, logger, options = {}) {
     return products;
 }
 
-async function handleMagentoBrowserScrape(baseUrl, logger, maxPages) {
+async function genericJsonLdBrowserScrape(baseUrl, logger, maxPages, pageParam, name) {
     let chromium;
     try { ({ chromium } = require('playwright')); }
     catch {
@@ -348,19 +388,14 @@ async function handleMagentoBrowserScrape(baseUrl, logger, maxPages) {
 
     try {
         const page = await ctx.newPage();
-        logger(`  -> Navigating to ${baseUrl}`);
-        await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForFunction(() => !/just a moment/i.test(document.title), { timeout: 30000 });
-        await page.waitForTimeout(1500);
-        logger('  -> Cloudflare bypass successful.');
+        logger(`  -> Browser navigating to ${baseUrl}`);
 
         for (let p = 1; p <= maxPages; p++) {
-            if (p > 1) {
-                const pageUrl = baseUrl.includes('?') ? `${baseUrl}&p=${p}` : `${baseUrl}?p=${p}`;
-                await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-                await page.waitForFunction(() => !/just a moment/i.test(document.title), { timeout: 20000 });
-                await page.waitForTimeout(800);
-            }
+            const url = buildPaginatedUrl(baseUrl, pageParam, p);
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await page.waitForFunction(() => !/just a moment/i.test(document.title), { timeout: 25000 });
+            if (p === 1) logger('  -> Cloudflare bypass OK.');
+            await page.waitForTimeout(1000);
 
             const html = await page.content();
             const items = extractItemListProducts(html);
@@ -368,11 +403,11 @@ async function handleMagentoBrowserScrape(baseUrl, logger, maxPages) {
 
             let newCount = 0;
             for (const item of items) {
-                const url = item.url || '';
-                if (url && seenUrls.has(url)) continue;
-                if (url) seenUrls.add(url);
+                const u = item.url || '';
+                if (u && seenUrls.has(u)) continue;
+                if (u) seenUrls.add(u);
                 newCount++;
-                products.push(normalizeMagentoProduct(item));
+                products.push(normalizeGenericProduct(item, name));
             }
 
             logger(`  -> Page ${p}: ${items.length} items (${newCount} new). Total: ${products.length}`);
@@ -386,28 +421,67 @@ async function handleMagentoBrowserScrape(baseUrl, logger, maxPages) {
     return products;
 }
 
-function normalizeMagentoProduct(item) {
-    const url = item.url || '';
-    const slug = url.replace(/\/$/, '').split('/').pop()?.split('?')[0] || '';
-    const offer = item.offers || {};
-    const price = offer.price != null ? Number(offer.price).toFixed(2) : '';
-    const available = typeof offer.availability === 'string' ? /InStock/i.test(offer.availability) : true;
+/**
+ * Ecwid — extracts storeId from page source, then calls the public Ecwid API.
+ * Falls back to JSON-LD if API unavailable.
+ */
+async function handleEcwidScrape(baseUrl, logger, options = {}) {
+    logger('\n[1/2] Fetching Ecwid store ID from page...');
+    const html = await quickDirectFetch(baseUrl);
+    const storeIdMatch = html?.match(/(?:store_id|storeId|ecwid_store_id)[^\d]*(\d{5,10})/i);
+    const storeId = storeIdMatch?.[1];
 
-    // Magento image URLs may be CDN-transformed — extract the clean path
-    const rawImage = item.image || '';
-    const image = rawImage.replace(/\/cdn-cgi\/image\/[^/]+\//, '/');
+    if (!storeId) {
+        logger('  -> Could not find Ecwid store ID. Falling back to JSON-LD extraction.');
+        return handleJsonLdScrape(baseUrl, logger, options, { name: 'Ecwid', pageParam: 'page' });
+    }
 
-    return {
-        id: slug,
-        title: item.name || slug,
-        handle: slug,
-        vendor: item.brand?.name || '',
-        product_type: 'Wheels',
-        tags: [item.color, item.material].filter(Boolean).join(' | '),
-        images: image ? [{ src: image }] : [],
-        variants: [{ sku: item.sku || item.mpn || slug, price, compare_at_price: null, available }],
-        url
-    };
+    logger(`  -> Store ID: ${storeId}`);
+    logger('\n[2/2] Fetching products via Ecwid public API...');
+
+    const products = [];
+    let offset = 0;
+    const limit = 100;
+    const maxItems = (!options.maxPages || options.maxPages === 'auto') ? 50000 : options.maxPages * limit;
+
+    while (products.length < maxItems) {
+        try {
+            const res = await fetchWithRetry({
+                method: 'get',
+                url: `https://app.ecwid.com/api/v3/${storeId}/products?limit=${limit}&offset=${offset}&sortBy=DEFINED_BY_STORE`,
+                headers: { 'User-Agent': UA },
+                timeout: 15000
+            });
+            const items = res.data?.items;
+            if (!items?.length) break;
+
+            for (const p of items) {
+                const price = p.price != null ? Number(p.price).toFixed(2) : '';
+                const img = p.imageUrl || p.thumbnailUrl || '';
+                products.push({
+                    id: String(p.id),
+                    title: p.name || '',
+                    handle: p.url?.split('/').pop()?.split('?')[0] || String(p.id),
+                    vendor: p.attributes?.find(a => a.name === 'Brand')?.value || '',
+                    product_type: p.categoryIds?.length ? String(p.categoryIds[0]) : '',
+                    tags: (p.attributes || []).map(a => `${a.name}: ${a.value}`).join(' | '),
+                    images: img ? [{ src: img }] : [],
+                    variants: [{ sku: p.sku || String(p.id), price, compare_at_price: null, available: p.inStock !== false }],
+                    url: p.url || ''
+                });
+            }
+
+            logger(`  -> Fetched ${products.length} products (offset ${offset})...`);
+            if (items.length < limit) break;
+            offset += limit;
+            await sleep(REQUEST_DELAY_MS);
+        } catch (err) {
+            logger(`  -> Ecwid API error: ${err.message}. Falling back to JSON-LD.`);
+            return handleJsonLdScrape(baseUrl, logger, options, { name: 'Ecwid', pageParam: 'page' });
+        }
+    }
+
+    return products;
 }
 
 async function handleCustomWheelOffsetScrape(baseUrl, logger, options = {}) {
@@ -873,12 +947,44 @@ async function detectPlatform(rawUrl, logger = console.log) {
             return { mode: 'magento', confidence: 'high', reason: 'Magento / Adobe Commerce detected in page source' };
         }
         // BigCommerce
-        if (/cdn\.bigcommerce\.com|BCData|bigcommerce/i.test(html)) {
-            return { mode: 'generic', confidence: 'medium', reason: 'BigCommerce detected (not natively supported)' };
+        if (/cdn\.bigcommerce\.com|window\.BCData|bigcommerce/i.test(html)) {
+            return { mode: 'bigcommerce', confidence: 'high', reason: 'BigCommerce detected in page source' };
         }
         // PrestaShop
-        if (/prestashop|id="prestashop"|var prestashop/i.test(html)) {
-            return { mode: 'generic', confidence: 'medium', reason: 'PrestaShop detected (not natively supported)' };
+        if (/var prestashop\s*=|PrestaShop\.com/i.test(html)) {
+            return { mode: 'prestashop', confidence: 'high', reason: 'PrestaShop detected in page source' };
+        }
+        // OpenCart
+        if (/opencart|catalog\/view\/theme/i.test(html)) {
+            return { mode: 'opencart', confidence: 'high', reason: 'OpenCart detected in page source' };
+        }
+        // Squarespace
+        if (/static\.squarespace\.com|squarespace-cdn/i.test(html)) {
+            return { mode: 'squarespace', confidence: 'high', reason: 'Squarespace detected in page source' };
+        }
+        // Ecwid
+        if (/app\.ecwid\.com|window\.ec\.config/i.test(html)) {
+            return { mode: 'ecwid', confidence: 'high', reason: 'Ecwid detected in page source' };
+        }
+        // nopCommerce
+        if (/Nop\.|nopCommerce/i.test(html)) {
+            return { mode: 'nopcommerce', confidence: 'high', reason: 'nopCommerce detected in page source' };
+        }
+        // Wix Stores
+        if (/wixstores|parastorage\.com|wix\.com\/stores/i.test(html)) {
+            return { mode: 'generic', confidence: 'medium', reason: 'Wix Stores detected — try Generic JSON-LD mode' };
+        }
+        // Salesforce Commerce Cloud
+        if (/demandware\.net|Demandware/i.test(html)) {
+            return { mode: 'generic', confidence: 'medium', reason: 'Salesforce Commerce Cloud detected — try Generic JSON-LD mode' };
+        }
+        // Shift4Shop / 3dcart
+        if (/shift4shop\.com|3dcartstores\.com/i.test(html)) {
+            return { mode: 'generic', confidence: 'medium', reason: 'Shift4Shop detected — try Generic JSON-LD mode' };
+        }
+        // Volusion
+        if (/volusion\.com/i.test(html)) {
+            return { mode: 'generic', confidence: 'medium', reason: 'Volusion detected — try Generic JSON-LD mode' };
         }
     }
 
@@ -937,8 +1043,17 @@ async function detectWithBrowser(rawUrl, origin, isSubPath, logger) {
             if (/cdn\.shopify\.com|Shopify\.theme|myshopify\.com/i.test(html) || window.Shopify) return 'shopify';
             if (/wp-content|woocommerce/i.test(html)) return 'woocommerce';
             if (/"magento":\{|Mage\.Cookies|\/media\/catalog\/product/i.test(html)) return 'magento';
-            if (/cdn\.bigcommerce\.com|BCData/i.test(html)) return 'bigcommerce';
-            if (/var prestashop|id="prestashop"/i.test(html)) return 'prestashop';
+            if (/cdn\.bigcommerce\.com|window\.BCData|bigcommerce/i.test(html)) return 'bigcommerce';
+            if (/var prestashop\s*=|PrestaShop\.com/i.test(html)) return 'prestashop';
+            if (/opencart|catalog\/view\/theme/i.test(html)) return 'opencart';
+            if (/static\.squarespace\.com|squarespace-cdn/i.test(html)) return 'squarespace';
+            if (/app\.ecwid\.com|window\.ec\.config/i.test(html)) return 'ecwid';
+            if (/Nop\.|nopCommerce/i.test(html)) return 'nopcommerce';
+            if (/wixstores|parastorage\.com|wix\.com\/stores/i.test(html)) return 'wix';
+            if (/demandware\.net|Demandware/i.test(html)) return 'sfcc';
+            if (/shift4shop\.com|3dcartstores\.com/i.test(html)) return 'shift4shop';
+            if (/volusion\.com/i.test(html)) return 'volusion';
+            if (/weebly\.com|editmysite\.com/i.test(html)) return 'weebly';
             return 'unknown';
         });
 
@@ -971,17 +1086,24 @@ async function detectWithBrowser(rawUrl, origin, isSubPath, logger) {
             return { mode: 'woocommerce', confidence: 'high', reason: 'Cloudflare-protected WooCommerce — Store API confirmed via browser' };
         }
 
-        if (platformHint === 'magento') {
-            return { mode: 'magento', confidence: 'high', reason: 'Magento / Adobe Commerce detected via browser — uses JSON-LD extraction' };
-        }
-        if (platformHint === 'bigcommerce') {
-            return { mode: 'generic', confidence: 'medium', reason: 'BigCommerce detected via browser (not natively supported)' };
-        }
-        if (platformHint === 'prestashop') {
-            return { mode: 'generic', confidence: 'medium', reason: 'PrestaShop detected via browser (not natively supported)' };
-        }
+        const platformMap = {
+            magento:     { mode: 'magento',     confidence: 'high',   reason: 'Magento / Adobe Commerce — JSON-LD extraction' },
+            bigcommerce: { mode: 'bigcommerce',  confidence: 'high',   reason: 'BigCommerce — JSON-LD extraction' },
+            prestashop:  { mode: 'prestashop',   confidence: 'high',   reason: 'PrestaShop — JSON-LD extraction' },
+            opencart:    { mode: 'opencart',     confidence: 'high',   reason: 'OpenCart — JSON-LD extraction' },
+            squarespace: { mode: 'squarespace',  confidence: 'high',   reason: 'Squarespace — JSON-LD extraction' },
+            ecwid:       { mode: 'ecwid',        confidence: 'high',   reason: 'Ecwid — public API + JSON-LD fallback' },
+            nopcommerce: { mode: 'nopcommerce',  confidence: 'high',   reason: 'nopCommerce — JSON-LD extraction' },
+            wix:         { mode: 'generic',      confidence: 'medium', reason: 'Wix Stores — try Generic JSON-LD mode' },
+            sfcc:        { mode: 'generic',      confidence: 'medium', reason: 'Salesforce Commerce Cloud detected — try Generic JSON-LD mode' },
+            shift4shop:  { mode: 'generic',      confidence: 'medium', reason: 'Shift4Shop detected — try Generic JSON-LD mode' },
+            volusion:    { mode: 'generic',      confidence: 'medium', reason: 'Volusion detected — try Generic JSON-LD mode' },
+            weebly:      { mode: 'generic',      confidence: 'medium', reason: 'Weebly/Square Online detected — try Generic JSON-LD mode' },
+        };
 
-        return { mode: 'shopify_browser', confidence: 'low', reason: `Unknown platform (hint: ${platformHint}) — try Shopify Browser mode` };
+        if (platformMap[platformHint]) return platformMap[platformHint];
+
+        return { mode: 'generic', confidence: 'low', reason: `Platform unrecognised — try Generic JSON-LD mode` };
     } catch (err) {
         return { mode: 'shopify_browser', confidence: 'low', reason: `Browser detection failed: ${err.message}` };
     } finally {

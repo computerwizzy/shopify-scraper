@@ -27,15 +27,29 @@
             <div class="mode-selector">
                 <label for="platform-mode">Extraction Mode</label>
                 <select id="platform-mode">
-                    <option value="shopify" selected>Shopify (Standard)</option>
-                    <option value="shopify_collection">Shopify (Collection Only)</option>
-                    <option value="shopify_browser">Shopify + Browser (Cloudflare bypass)</option>
-                    <option value="shopify_browser_collection">Shopify + Browser — Collection (Cloudflare bypass)</option>
-                    <option value="magento">Magento / Adobe Commerce</option>
-                    <option value="woocommerce">WooCommerce (Beta)</option>
-                    <option value="customwheeloffset">Custom Wheel Offset (Automotive)</option>
-                    <option value="forgiato">Forgiato Wheels (Cloudflare-protected)</option>
-                    <option value="generic">Generic HTML (Alpha)</option>
+                    <optgroup label="— Shopify —">
+                        <option value="shopify" selected>Shopify (Standard)</option>
+                        <option value="shopify_collection">Shopify (Collection Only)</option>
+                        <option value="shopify_browser">Shopify + Browser (Cloudflare bypass)</option>
+                        <option value="shopify_browser_collection">Shopify + Browser — Collection (Cloudflare bypass)</option>
+                    </optgroup>
+                    <optgroup label="— Other Platforms —">
+                        <option value="magento">Magento / Adobe Commerce</option>
+                        <option value="woocommerce">WooCommerce / WordPress</option>
+                        <option value="bigcommerce">BigCommerce</option>
+                        <option value="prestashop">PrestaShop</option>
+                        <option value="opencart">OpenCart</option>
+                        <option value="squarespace">Squarespace</option>
+                        <option value="ecwid">Ecwid</option>
+                        <option value="nopcommerce">nopCommerce</option>
+                    </optgroup>
+                    <optgroup label="— Specialty —">
+                        <option value="customwheeloffset">Custom Wheel Offset (Automotive)</option>
+                        <option value="forgiato">Forgiato Wheels (Cloudflare-protected)</option>
+                    </optgroup>
+                    <optgroup label="— Fallback —">
+                        <option value="generic">Generic (JSON-LD auto-extract)</option>
+                    </optgroup>
                 </select>
             </div>
             <div class="input-group">

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shopify Scraper Elite | Premium eCommerce Intelligence</title>
+    <meta name="description" content="Discover product insights from any Shopify store with our high-performance scraper.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <main class="container">
+        <header class="hero">
+            <h1 class="glitch" data-text="Shopify Scraper Elite">Shopify Scraper Elite</h1>
+            <p class="subtitle">Extract products and collections with precision and speed.</p>
+        </header>
+
+        <section class="card glass">
+            <div class="mode-selector">
+                <label for="platform-mode">Extraction Mode</label>
+                <select id="platform-mode">
+                    <option value="shopify" selected>Shopify (Standard)</option>
+                    <option value="shopify_collection">Shopify (Collection Only)</option>
+                    <option value="woocommerce">WooCommerce (Beta)</option>
+                    <option value="customwheeloffset">Custom Wheel Offset (Automotive)</option>
+                    <option value="forgiato">Forgiato Wheels (Cloudflare-protected)</option>
+                    <option value="generic">Generic HTML (Alpha)</option>
+                </select>
+            </div>
+            <div class="input-group">
+                <input type="text" id="store-url" placeholder="Enter store or collection URL" autocomplete="off">
+                <button id="scrape-btn">
+                    <span class="btn-text">Initialize Scrape</span>
+                    <span class="loader hidden"></span>
+                </button>
+            </div>
+            <div id="max-pages-group" class="mode-selector hidden">
+                <label for="max-pages">Max Pages (Custom Wheel Offset)</label>
+                <input type="text" id="max-pages" value="auto" placeholder="auto or a number like 50">
+                <p class="hint">Enter <strong>auto</strong> to detect the end automatically, or a number to cap the scrape. ~30 products per page.</p>
+            </div>
+            <p class="hint">Select platform mode and enter the base URL or specific collection link.</p>
+        </section>
+
+        <section id="status-card" class="card glass hidden">
+            <div class="status-header">
+                <div class="pulse-container">
+                    <div class="pulse"></div>
+                    <span id="status-text">Ready</span>
+                </div>
+                <div id="progress-container" class="hidden">
+                    <div class="progress-bar">
+                        <div id="progress-fill" style="width: 0%"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="terminal" id="log-viewer">
+                <div class="log-line system">> Initializing environment...</div>
+            </div>
+
+            <div id="results-area" class="hidden">
+                <h3>Extraction Complete</h3>
+                <div class="download-links">
+                    <a id="download-csv" href="#" class="btn-download" download>
+                        <img src="https://img.icons8.com/color/48/csv.png" alt="CSV">
+                        Download CSV
+                    </a>
+                    <a id="download-json" href="#" class="btn-download" download>
+                        <img src="https://img.icons8.com/color/48/json--v1.png" alt="JSON">
+                        Download JSON
+                    </a>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Scraper Elite. Built for Advanced eCommerce Intelligence.</p>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

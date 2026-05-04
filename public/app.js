@@ -54,6 +54,9 @@ scrapeBtn.addEventListener('click', async () => {
 
         if (!response.ok) {
             const err = await response.json();
+            if (response.status === 409) {
+                throw new Error('A scrape is already running. Wait for it to finish, then try again.');
+            }
             throw new Error(err.error || 'Failed to start scrape');
         }
 

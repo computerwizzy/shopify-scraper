@@ -1,22 +1,57 @@
+require('dotenv').config();
 const axios = require('axios');
 const fs = require('fs');
+const path = require('path');
 const { createObjectCsvWriter } = require('csv-writer');
 
-/**
- * Main scraping function that routes to different platform handlers
- *
- * @param {string} baseUrl   Store URL (or category URL for customwheeloffset)
- * @param {Function} logger  Log sink
- * @param {string} mode      'shopify' | 'shopify_collection' | 'woocommerce' | 'customwheeloffset' | 'forgiato'
- * @param {object} options   { maxPages: number|'auto' }
- */
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '3', 10);
+const REQUEST_DELAY_MS = parseInt(process.env.REQUEST_DELAY_MS || '800', 10);
+const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
+function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
+function validateUrl(raw) {
+    try {
+        const u = new URL(raw);
+        if (!['http:', 'https:'].includes(u.protocol)) return false;
+        const h = u.hostname.toLowerCase();
+        // Block private/loopback ranges to prevent SSRF
+        if (/^(localhost|127\.|0\.0\.0\.0|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(h)) return false;
+        if (h === '::1' || h === '[::1]') return false;
+        return true;
+    } catch { return false; }
+}
+
+async function fetchWithRetry(config, retries = MAX_RETRIES) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await axios(config);
+        } catch (err) {
+            const status = err.response?.status;
+            // Don't retry client errors (except 429 rate limit)
+            if (status && status < 500 && status !== 429) throw err;
+            if (attempt === retries) throw err;
+            await sleep(REQUEST_DELAY_MS * Math.pow(2, attempt));
+        }
+    }
+}
+
 async function scrapeShopifyStore(baseUrl, logger = console.log, mode = 'shopify', options = {}) {
     if (!baseUrl) {
-        logger("Error: No store URL provided.");
-        return { success: false, error: "No URL provided" };
+        logger('Error: No store URL provided.');
+        return { success: false, error: 'No URL provided' };
     }
 
-    baseUrl = baseUrl.replace(/\/$/, "");
+    if (!validateUrl(baseUrl)) {
+        logger('Error: Invalid or disallowed URL.');
+        return { success: false, error: 'Invalid or disallowed URL' };
+    }
+
+    baseUrl = baseUrl.replace(/\/$/, '');
     const filePrefix = generateFilePrefix(baseUrl);
     logger(`Starting [${mode.toUpperCase()}] scraper for: ${baseUrl}`);
     if (options.maxPages) logger(`  (Page limit: ${options.maxPages})`);
@@ -36,16 +71,16 @@ async function scrapeShopifyStore(baseUrl, logger = console.log, mode = 'shopify
         } else if (mode === 'forgiato') {
             products = await handleForgiatoScrape(baseUrl, logger, options);
         } else {
-            logger(`Mode [${mode}] is not fully implemented yet. Falling back to basic Shopify logic.`);
+            logger(`Mode [${mode}] not implemented. Falling back to Shopify.`);
             const result = await handleShopifyScrape(baseUrl, 'shopify', logger);
             products = result.products;
         }
 
-        if (products && products.length > 0) {
-            return await saveResults(products, collections, filePrefix, logger, mode);
+        if (products?.length > 0) {
+            return await saveResults(products, collections, filePrefix, logger);
         } else {
-            logger("No products found to save.");
-            return { success: false, error: "No products found" };
+            logger('No products found to save.');
+            return { success: false, error: 'No products found' };
         }
     } catch (error) {
         logger(`Critical error: ${error.message}`);
@@ -53,27 +88,29 @@ async function scrapeShopifyStore(baseUrl, logger = console.log, mode = 'shopify
     }
 }
 
-/**
- * Handles Shopify Product/Collection JSON scraping
- */
 async function handleShopifyScrape(baseUrl, mode, logger) {
     let collections = [];
     let products = [];
-    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
     if (mode === 'shopify') {
-        logger("\n[1/2] Fetching Shopify collections...");
+        logger('\n[1/2] Fetching Shopify collections...');
         let page = 1;
         let hasMore = true;
         while (hasMore) {
             try {
-                const res = await axios.get(`${baseUrl}/collections.json?limit=250&page=${page}`, { headers: { 'User-Agent': userAgent } });
+                const res = await fetchWithRetry({
+                    method: 'get',
+                    url: `${baseUrl}/collections.json?limit=250&page=${page}`,
+                    headers: { 'User-Agent': UA },
+                    timeout: 20000
+                });
                 if (res.data?.collections?.length > 0) {
                     collections.push(...res.data.collections);
                     logger(`  -> Fetched ${res.data.collections.length} collections (page ${page})`);
                     page++;
+                    await sleep(REQUEST_DELAY_MS);
                 } else { hasMore = false; }
-            } catch (err) { hasMore = false; }
+            } catch { hasMore = false; }
         }
     }
 
@@ -81,27 +118,37 @@ async function handleShopifyScrape(baseUrl, mode, logger) {
 
     let totalExpected = 0;
     try {
-        const countRes = await axios.get(`${baseUrl}/products/count.json`, { headers: { 'User-Agent': userAgent } });
+        const countRes = await fetchWithRetry({
+            method: 'get',
+            url: `${baseUrl}/products/count.json`,
+            headers: { 'User-Agent': UA },
+            timeout: 10000
+        });
         totalExpected = countRes.data.count || 0;
-        if (totalExpected) logger(`  (Total products found in store: ${totalExpected})`);
-    } catch (e) { /* ignore */ }
+        if (totalExpected) logger(`  (Total products: ${totalExpected})`);
+    } catch { /* not all stores expose this */ }
 
     let page = 1;
     let hasMore = true;
     while (hasMore) {
         try {
-            const url = `${baseUrl}/products.json?limit=250&page=${page}`;
-            const res = await axios.get(url, { headers: { 'User-Agent': userAgent } });
+            const res = await fetchWithRetry({
+                method: 'get',
+                url: `${baseUrl}/products.json?limit=250&page=${page}`,
+                headers: { 'User-Agent': UA },
+                timeout: 20000
+            });
             if (res.data?.products?.length > 0) {
                 products.push(...res.data.products);
-                const progressMsg = totalExpected
+                const msg = totalExpected
                     ? `Fetched ${products.length}/${totalExpected} products...`
                     : `Fetched ${products.length} products (page ${page})...`;
-                logger(`  -> ${progressMsg}`);
+                logger(`  -> ${msg}`);
                 page++;
+                await sleep(REQUEST_DELAY_MS);
             } else { hasMore = false; }
         } catch (err) {
-            logger(`  -> Finished fetching (End of data or ${err.response?.status || 'error'})`);
+            logger(`  -> Finished (${err.response?.status || err.message})`);
             hasMore = false;
         }
     }
@@ -109,26 +156,16 @@ async function handleShopifyScrape(baseUrl, mode, logger) {
     return { products, collections };
 }
 
-/**
- * Handles Custom Wheel Offset SCRAPER
- * Parses the embedded JSON-LD ItemList payload (the page is client-rendered,
- * so cheerio selectors against the visible DOM return nothing).
- *
- * The full catalog is ~5,476 pages (~164k SKUs). Filtered URLs (by brand, size,
- * etc.) are much smaller. Pass options.maxPages for a hard cap, or set it to
- * 'auto' / 0 / null to scrape until the site returns an empty page.
- */
 async function handleCustomWheelOffsetScrape(baseUrl, logger, options = {}) {
     const rawLimit = options.maxPages;
     const autoDetect = rawLimit === 'auto' || rawLimit === 0 || rawLimit === null;
     const hardCeiling = 6000;
     const maxPages = autoDetect ? hardCeiling : (rawLimit || 50);
-
     const modeLabel = autoDetect ? 'auto-detect (stops on empty page)' : `up to ${maxPages} pages`;
-    logger(`\n[1/1] Fetching Custom Wheel Offset products (JSON-LD extraction, ${modeLabel})...`);
+
+    logger(`\n[1/1] Fetching Custom Wheel Offset products (${modeLabel})...`);
     const products = [];
     const seenSkus = new Set();
-    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
     for (let page = 1; page <= maxPages; page++) {
         const pageUrl = baseUrl.includes('?') ? `${baseUrl}&page=${page}` : `${baseUrl}?page=${page}`;
@@ -136,9 +173,11 @@ async function handleCustomWheelOffsetScrape(baseUrl, logger, options = {}) {
 
         let html;
         try {
-            const res = await axios.get(pageUrl, {
+            const res = await fetchWithRetry({
+                method: 'get',
+                url: pageUrl,
                 headers: {
-                    'User-Agent': userAgent,
+                    'User-Agent': UA,
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.9',
                     'Referer': 'https://www.google.com/'
@@ -153,7 +192,7 @@ async function handleCustomWheelOffsetScrape(baseUrl, logger, options = {}) {
 
         const items = extractItemListProducts(html);
         if (items.length === 0) {
-            logger(`  -> No products found on page ${page}. Stopping.`);
+            logger(`  -> No products on page ${page}. Stopping.`);
             break;
         }
 
@@ -170,15 +209,12 @@ async function handleCustomWheelOffsetScrape(baseUrl, logger, options = {}) {
             const priceRaw = offer.price ?? '';
             const price = priceRaw === '' ? '' : Number(priceRaw).toFixed(2);
             const available = typeof offer.availability === 'string'
-                ? /InStock/i.test(offer.availability)
-                : true;
+                ? /InStock/i.test(offer.availability) : true;
 
             const specTags = [
                 item.height && item.width ? `${item.width}x${item.height}`.replace(/in/gi, '') : '',
                 item.depth ? `offset ${item.depth}` : '',
-                item.color,
-                item.material,
-                item.weight
+                item.color, item.material, item.weight
             ].filter(Boolean).join(' | ');
 
             products.push({
@@ -189,31 +225,22 @@ async function handleCustomWheelOffsetScrape(baseUrl, logger, options = {}) {
                 product_type: 'Wheels',
                 tags: specTags,
                 images: item.image ? [{ src: item.image }] : [],
-                variants: [{
-                    sku,
-                    price,
-                    compare_at_price: null,
-                    available
-                }]
+                variants: [{ sku, price, compare_at_price: null, available }]
             });
         }
 
         logger(`  -> Extracted ${items.length} items (${newCount} new) from page ${page}. Total: ${products.length}`);
-
         if (newCount === 0) {
             logger(`  -> No new SKUs on page ${page}. Stopping.`);
             break;
         }
 
-        await new Promise(r => setTimeout(r, 1200));
+        await sleep(REQUEST_DELAY_MS + Math.floor(Math.random() * 400));
     }
 
     return products;
 }
 
-/**
- * Extracts products from JSON-LD ItemList payloads embedded in a page's <script> tags.
- */
 function extractItemListProducts(html) {
     const products = [];
     const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/g;
@@ -222,18 +249,18 @@ function extractItemListProducts(html) {
         const body = m[1].trim();
         if (!body.includes('ItemList') || !body.includes('itemListElement')) continue;
 
-        const normalized = body.replace(/"itemListElement"\s*:\s*\[\s*\[/, '"itemListElement":[')
-                               .replace(/\]\s*\]\s*\}\s*$/, ']}');
+        const normalized = body
+            .replace(/"itemListElement"\s*:\s*\[\s*\[/, '"itemListElement":[')
+            .replace(/\]\s*\]\s*\}\s*$/, ']}');
         try {
             const parsed = JSON.parse(normalized);
-            const list = parsed.itemListElement || [];
-            for (const entry of list) {
+            for (const entry of (parsed.itemListElement || [])) {
                 if (entry?.item) products.push(entry.item);
             }
         } catch {
-            const productRegex = /\{"@type":"Product"[\s\S]*?\}\}\}/g;
+            const pmRe = /\{"@type":"Product"[\s\S]*?\}\}\}/g;
             let pm;
-            while ((pm = productRegex.exec(body))) {
+            while ((pm = pmRe.exec(body))) {
                 try { products.push(JSON.parse(pm[0])); } catch { /* skip */ }
             }
         }
@@ -241,28 +268,22 @@ function extractItemListProducts(html) {
     return products;
 }
 
-/**
- * Handles Forgiato (forgiato.com) SCRAPER
- * Forgiato sits behind a Cloudflare JS challenge, so we use Playwright to render
- * the page and pull the JSON-LD Product block from each wheel page.
- */
 async function handleForgiatoScrape(baseUrl, logger, options = {}) {
     let chromium;
-    try {
-        ({ chromium } = require('playwright'));
-    } catch {
-        logger('  -> playwright is not installed. Run: npm install playwright && npx playwright install chromium');
+    try { ({ chromium } = require('playwright')); }
+    catch {
+        logger('  -> playwright not installed. Run: npm install playwright && npx playwright install chromium');
         return [];
     }
 
     const indexUrl = baseUrl.endsWith('/wheels') || baseUrl.includes('/wheels/') ? baseUrl : `${baseUrl.replace(/\/$/, '')}/wheels`;
-    logger(`\n[1/2] Launching browser to defeat Cloudflare challenge...`);
+    logger('\n[1/2] Launching browser to bypass Cloudflare...');
 
-    // Cloudflare blocks headless Chromium aggressively; default to headful.
-    const headless = options.headless === true;
+    // Cloudflare blocks headless Chromium aggressively; headful is default unless FORGIATO_HEADLESS=true
+    const headless = process.env.FORGIATO_HEADLESS === 'true' || options.headless === true;
     const browser = await chromium.launch({ headless });
     const ctx = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        userAgent: UA,
         viewport: { width: 1366, height: 768 },
         locale: 'en-US'
     });
@@ -279,30 +300,26 @@ async function handleForgiatoScrape(baseUrl, logger, options = {}) {
             const urls = new Set();
             for (const a of document.querySelectorAll('a[href]')) {
                 const href = a.href;
-                if (/\/wheels\/[^\/]+\/[^\/]+\/?$/.test(href) && !/\/wheels\/$/.test(href)) {
+                if (/\/wheels\/[^\/]+\/[^\/]+\/?$/.test(href) && !/\/wheels\/$/.test(href))
                     urls.add(href.replace(/\?.*$/, ''));
-                }
             }
             return [...urls];
         });
 
         logger(`  -> Found ${wheelLinks.length} unique wheel pages.`);
-        if (wheelLinks.length === 0) {
-            logger('  -> No wheels found on the index page. Aborting.');
-            return [];
-        }
+        if (!wheelLinks.length) { logger('  -> No wheels found. Aborting.'); return []; }
 
         const limit = options.limit || parseInt(process.env.FORGIATO_LIMIT || '0', 10);
         const targets = limit > 0 ? wheelLinks.slice(0, limit) : wheelLinks;
-        if (limit > 0) logger(`  -> Limiting to first ${targets.length} wheel(s) per options.limit.`);
+        if (limit > 0) logger(`  -> Limiting to first ${targets.length} wheel(s).`);
 
-        logger(`\n[2/2] Scraping each product page...`);
+        logger('\n[2/2] Scraping each product page...');
         for (let i = 0; i < targets.length; i++) {
             const url = targets[i];
             try {
                 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-                // Cloudflare re-challenges on navigation. Wait for the challenge to clear.
+                // Wait for Cloudflare challenge to clear on each navigation
                 await page.waitForFunction(() => {
                     if (/just a moment/i.test(document.title)) return false;
                     if (document.querySelector('h1.wd-header__name')) return true;
@@ -317,12 +334,11 @@ async function handleForgiatoScrape(baseUrl, logger, options = {}) {
                 }, { timeout: 45000 });
 
                 const data = await page.evaluate(() => {
-                    const decode = s => {
-                        if (!s || typeof s !== 'string') return s;
-                        return s.replace(/&#34;/g, '"').replace(/&#39;/g, "'")
-                                .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
-                                .replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-                    };
+                    const decode = s => typeof s === 'string'
+                        ? s.replace(/&#34;/g, '"').replace(/&#39;/g, "'")
+                           .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
+                           .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+                        : s;
 
                     let productLd = null;
                     for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
@@ -336,9 +352,11 @@ async function handleForgiatoScrape(baseUrl, logger, options = {}) {
                         } catch {}
                     }
 
-                    const h1 = (document.querySelector('h1.wd-header__name')
-                        || document.querySelector('main h1')
-                        || document.querySelector('h1'))?.textContent?.trim();
+                    const h1 = (
+                        document.querySelector('h1.wd-header__name') ||
+                        document.querySelector('main h1') ||
+                        document.querySelector('h1')
+                    )?.textContent?.trim();
 
                     const series = [...document.querySelectorAll('.wheel-series, [class*="series"], h2, .tag')]
                         .map(e => e.textContent.trim())
@@ -349,23 +367,19 @@ async function handleForgiatoScrape(baseUrl, logger, options = {}) {
                         .filter(i => i.src && !/logo|icon|og-image|forging-sketch/i.test(i.src));
 
                     return {
-                        h1,
-                        series,
-                        productLd: productLd ? JSON.parse(JSON.stringify(productLd, (_k, v) => typeof v === 'string' ? decode(v) : v)) : null,
+                        h1, series,
+                        productLd: productLd
+                            ? JSON.parse(JSON.stringify(productLd, (_k, v) => typeof v === 'string' ? decode(v) : v))
+                            : null,
                         images: allImages
                     };
                 });
 
                 const ld = data.productLd || {};
-                const additional = Object.fromEntries(
-                    (ld.additionalProperty || []).map(p => [p.name, p.value])
-                );
-
+                const additional = Object.fromEntries((ld.additionalProperty || []).map(p => [p.name, p.value]));
                 const primaryImage = ld.image || data.images[0]?.src || '';
                 const galleryImages = [...new Set(data.images.map(i => i.src))];
-
-                const priceRaw = ld.offers?.price ?? '';
-                const price = priceRaw === '' ? '' : Number(priceRaw).toFixed(2);
+                const price = ld.offers?.price ? Number(ld.offers.price).toFixed(2) : '';
 
                 const tagParts = [
                     additional['Construction'],
@@ -407,7 +421,7 @@ async function handleForgiatoScrape(baseUrl, logger, options = {}) {
                 logger(`  -> [${i + 1}/${targets.length}] Failed: ${url} — ${err.message}`);
             }
 
-            await page.waitForTimeout(400);
+            await page.waitForTimeout(500 + Math.floor(Math.random() * 300));
         }
     } finally {
         await browser.close();
@@ -416,65 +430,70 @@ async function handleForgiatoScrape(baseUrl, logger, options = {}) {
     return products;
 }
 
-/**
- * Handles WooCommerce Public JSON API scraping (Store API — no auth required)
- */
 async function handleWooCommerceScrape(baseUrl, logger) {
-    logger("\n[1/1] Fetching WooCommerce products...");
+    logger('\n[1/1] Fetching WooCommerce products...');
     let products = [];
     let page = 1;
-    let hasMore = true;
-    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+    const PAGE_CAP = 200;
 
-    while (hasMore && page <= 20) {
+    while (page <= PAGE_CAP) {
         try {
-            const res = await axios.get(`${baseUrl}/wp-json/wc/store/v1/products?page=${page}&per_page=100`, {
-                headers: { 'User-Agent': userAgent }
+            const res = await fetchWithRetry({
+                method: 'get',
+                url: `${baseUrl}/wp-json/wc/store/v1/products?page=${page}&per_page=100`,
+                headers: { 'User-Agent': UA },
+                timeout: 20000
             });
-            if (res.data?.length > 0) {
-                const mapped = res.data.map(p => ({
-                    id: p.id,
-                    title: p.name,
-                    handle: p.slug,
-                    vendor: baseUrl,
-                    product_type: p.categories?.[0]?.name || 'General',
-                    tags: (p.tags || []).map(t => t.name).join(', '),
-                    images: p.images,
-                    variants: [{
-                        sku: p.sku,
-                        price: p.prices?.price ? (Number(p.prices.price) / Math.pow(10, p.prices.currency_minor_unit || 2)).toFixed(2) : '',
-                        compare_at_price: p.prices?.regular_price ? (Number(p.prices.regular_price) / Math.pow(10, p.prices.currency_minor_unit || 2)).toFixed(2) : '',
-                        available: p.is_in_stock !== false
-                    }]
-                }));
-                products.push(...mapped);
-                logger(`  -> Fetched ${res.data.length} products (page ${page})`);
-                page++;
-            } else { hasMore = false; }
+            if (!res.data?.length) break;
+            const mapped = res.data.map(p => ({
+                id: p.id,
+                title: p.name,
+                handle: p.slug,
+                vendor: baseUrl,
+                product_type: p.categories?.[0]?.name || 'General',
+                tags: (p.tags || []).map(t => t.name).join(', '),
+                images: p.images,
+                variants: [{
+                    sku: p.sku,
+                    price: p.prices?.price
+                        ? (Number(p.prices.price) / Math.pow(10, p.prices.currency_minor_unit || 2)).toFixed(2)
+                        : '',
+                    compare_at_price: p.prices?.regular_price
+                        ? (Number(p.prices.regular_price) / Math.pow(10, p.prices.currency_minor_unit || 2)).toFixed(2)
+                        : '',
+                    available: p.is_in_stock !== false
+                }]
+            }));
+            products.push(...mapped);
+            logger(`  -> Fetched ${res.data.length} products (page ${page})`);
+            page++;
+            await sleep(REQUEST_DELAY_MS);
         } catch (err) {
-            logger(`  -> WC Store API unavailable (${err.response?.status || err.message}).`);
-            hasMore = false;
+            logger(`  -> WC Store API error (${err.response?.status || err.message}).`);
+            break;
         }
     }
     return products;
 }
 
-/**
- * Formats and saves results to JSON and CSV
- */
-async function saveResults(products, collections, filePrefix, logger, mode) {
-    const prodJson = `${filePrefix}_products.json`;
-    const prodCsv = `${filePrefix}_products.csv`;
+async function saveResults(products, collections, filePrefix, logger) {
+    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
-    fs.writeFileSync(prodJson, JSON.stringify(products, null, 2));
-    logger(`=> Saved JSON to ${prodJson}`);
+    const jsonFile = `${filePrefix}_products.json`;
+    const csvFile = `${filePrefix}_products.csv`;
 
-    if (collections.length > 0) {
-        fs.writeFileSync(`${filePrefix}_collections.json`, JSON.stringify(collections, null, 2));
+    fs.writeFileSync(path.join(DOWNLOADS_DIR, jsonFile), JSON.stringify(products, null, 2));
+    logger(`=> Saved JSON: ${jsonFile}`);
+
+    if (collections?.length > 0) {
+        fs.writeFileSync(
+            path.join(DOWNLOADS_DIR, `${filePrefix}_collections.json`),
+            JSON.stringify(collections, null, 2)
+        );
     }
 
     const csvWriter = createObjectCsvWriter({
-        path: prodCsv,
+        path: path.join(DOWNLOADS_DIR, csvFile),
         header: [
             { id: 'productId', title: 'Product ID' },
             { id: 'handle', title: 'Handle' },
@@ -490,47 +509,40 @@ async function saveResults(products, collections, filePrefix, logger, mode) {
         ]
     });
 
-    const csvRecords = [];
+    const records = [];
     for (const p of products) {
         const defaultImage = p.images?.[0]?.src || '';
         const tags = Array.isArray(p.tags) ? p.tags.join(', ') : (p.tags || '');
-
         for (const v of (p.variants || [{}])) {
-            const variantImage = v.featured_image?.src || defaultImage;
-            csvRecords.push({
+            records.push({
                 productId: p.id || '',
                 handle: p.handle || '',
                 title: p.title || '',
                 vendor: p.vendor || '',
                 type: p.product_type || p.type || '',
-                tags: tags,
+                tags,
                 sku: v.sku || '',
                 price: v.price || '',
                 compareAtPrice: v.compare_at_price || '',
                 inStock: v.available === false ? 'No' : 'Yes',
-                image: variantImage
+                image: v.featured_image?.src || defaultImage
             });
         }
     }
 
-    await csvWriter.writeRecords(csvRecords);
-    logger(`=> Saved ${csvRecords.length} items to CSV: ${prodCsv}`);
+    await csvWriter.writeRecords(records);
+    logger(`=> Saved ${records.length} rows to CSV: ${csvFile}`);
 
-    return {
-        success: true,
-        files: { json: prodJson, csv: prodCsv }
-    };
+    return { success: true, files: { json: jsonFile, csv: csvFile } };
 }
 
 function generateFilePrefix(url) {
     try {
-        const urlObj = new URL(url);
-        let prefix = urlObj.hostname.replace(/[^a-zA-Z0-9]/g, '_');
-        if (urlObj.pathname.length > 1) {
-            prefix += urlObj.pathname.replace(/[^a-zA-Z0-9]/g, '_');
-        }
-        return prefix;
-    } catch (e) {
+        const u = new URL(url);
+        let prefix = u.hostname.replace(/[^a-zA-Z0-9]/g, '_');
+        if (u.pathname.length > 1) prefix += u.pathname.replace(/[^a-zA-Z0-9]/g, '_');
+        return prefix.replace(/_{2,}/g, '_').replace(/^_|_$/g, '');
+    } catch {
         return url.replace(/[^a-zA-Z0-9]/g, '_');
     }
 }
@@ -538,12 +550,11 @@ function generateFilePrefix(url) {
 if (require.main === module) {
     const args = process.argv.slice(2);
     if (!args[0]) {
-        console.log("Usage: node index.js <url> [mode] [maxPages|auto]");
-        console.log("  modes: shopify | shopify_collection | woocommerce | customwheeloffset | forgiato");
-        console.log("  maxPages: only used by customwheeloffset");
-        console.log("    - a number (default 50) caps the scrape");
-        console.log("    - 'auto' keeps fetching until the site returns an empty page");
-        console.log("    - full catalog is ~5,476 pages (~164k SKUs)");
+        console.log('Usage: node index.js <url> [mode] [maxPages|auto]');
+        console.log('  modes: shopify | shopify_collection | woocommerce | customwheeloffset | forgiato | generic');
+        console.log('  maxPages: only used by customwheeloffset');
+        console.log('    - a number (default 50) caps the scrape');
+        console.log("    - 'auto' keeps fetching until an empty page is returned");
     } else {
         let options = {};
         if (args[2]) {

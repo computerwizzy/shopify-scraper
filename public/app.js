@@ -47,15 +47,25 @@ detectBtn.addEventListener('click', async () => {
         });
         const data = await res.json();
 
-        if (data.mode) {
+        if (data.confidence === 'high' || data.confidence === 'medium') {
             platformMode.value = data.mode;
             toggleMaxPagesVisibility();
-            const badge = data.confidence === 'high' ? '✓' : data.confidence === 'medium' ? '~' : '?';
-            detectResult.textContent = `${badge} Detected: ${platformMode.options[platformMode.selectedIndex].text} — ${data.reason}`;
-            detectResult.style.color = data.confidence === 'high' ? '#34d399' : data.confidence === 'medium' ? '#fbbf24' : '#f87171';
+            const badge = data.confidence === 'high' ? '✓' : '~';
+            detectResult.innerHTML = `${badge} Detected: <strong>${platformMode.options[platformMode.selectedIndex].text}</strong> — ${data.reason}`;
+            detectResult.style.color = data.confidence === 'high' ? '#34d399' : '#fbbf24';
         } else {
-            detectResult.textContent = `Could not detect platform: ${data.reason || data.error}`;
-            detectResult.style.color = '#f87171';
+            // Low confidence or blocked — give the user actionable manual steps
+            const origin = (() => { try { return new URL(url).origin; } catch { return url; } })();
+            detectResult.innerHTML =
+                `⚠ Could not auto-detect (site blocked our server).<br>` +
+                `Check these URLs in your own browser:<br>` +
+                `&nbsp;&nbsp;<a href="${origin}/products.json?limit=1" target="_blank" style="color:#a78bfa">${origin}/products.json?limit=1</a> → JSON with "products" array = <strong>Shopify</strong><br>` +
+                `&nbsp;&nbsp;<a href="${origin}/wp-json" target="_blank" style="color:#a78bfa">${origin}/wp-json</a> → JSON with "namespaces" = <strong>WooCommerce</strong>`;
+            detectResult.style.color = '#fbbf24';
+            if (data.mode) {
+                platformMode.value = data.mode;
+                toggleMaxPagesVisibility();
+            }
         }
         detectResult.classList.remove('hidden');
     } catch (err) {

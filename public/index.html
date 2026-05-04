@@ -39,17 +39,22 @@
             </div>
             <div class="input-group">
                 <input type="text" id="store-url" placeholder="Enter store or collection URL" autocomplete="off">
+                <button id="detect-btn">
+                    <span class="btn-text">Detect</span>
+                    <span class="loader hidden"></span>
+                </button>
                 <button id="scrape-btn">
                     <span class="btn-text">Initialize Scrape</span>
                     <span class="loader hidden"></span>
                 </button>
             </div>
+            <div id="detect-result" class="hint hidden"></div>
             <div id="max-pages-group" class="mode-selector hidden">
                 <label for="max-pages">Max Pages (Custom Wheel Offset)</label>
                 <input type="text" id="max-pages" value="auto" placeholder="auto or a number like 50">
                 <p class="hint">Enter <strong>auto</strong> to detect the end automatically, or a number to cap the scrape. ~30 products per page.</p>
             </div>
-            <p class="hint">Select platform mode and enter the base URL or specific collection link.</p>
+            <p class="hint">Not sure which mode? Click <strong>Detect</strong> to auto-identify the platform.</p>
         </section>
 
         <section id="status-card" class="card glass hidden">

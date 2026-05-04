@@ -673,4 +673,157 @@ if (require.main === module) {
     }
 }
 
-module.exports = { scrapeShopifyStore };
+/**
+ * Detects what ecommerce platform a URL is running on.
+ * Returns { mode, confidence, reason } where mode matches the UI dropdown values.
+ *
+ * Strategy:
+ *  1. Try a direct HTTP request and scan HTML for platform signatures
+ *  2. Try Shopify / WooCommerce JSON endpoints directly
+ *  3. If blocked by WAF/Cloudflare, launch a browser, bypass the challenge,
+ *     and test endpoints from inside the browser session
+ */
+async function detectPlatform(rawUrl, logger = console.log) {
+    if (!validateUrl(rawUrl)) return { mode: null, confidence: 'none', reason: 'Invalid URL' };
+
+    const urlObj = new URL(rawUrl.replace(/\/$/, ''));
+    const origin = urlObj.origin;
+    const isSubPath = urlObj.pathname.length > 1;
+
+    logger('Detecting platform...');
+
+    // --- Phase 1: direct HTTP ---
+    let html = '';
+    let directBlocked = false;
+    try {
+        const res = await axios.get(rawUrl, {
+            headers: { 'User-Agent': UA },
+            timeout: 10000,
+            validateStatus: s => s < 500
+        });
+        html = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    } catch (err) {
+        const status = err.response?.status;
+        if (status === 403 || status === 503 || !status) {
+            logger('  -> Direct request blocked (WAF/Cloudflare). Switching to browser detection...');
+            directBlocked = true;
+        }
+    }
+
+    if (!directBlocked && html) {
+        // Shopify signatures
+        if (/cdn\.shopify\.com|Shopify\.theme|myshopify\.com|shopify-features/i.test(html)) {
+            const confirmed = await probeShopifyEndpoints(origin);
+            const mode = isSubPath ? 'shopify_collection' : 'shopify';
+            return { mode, confidence: confirmed ? 'high' : 'medium', reason: confirmed ? 'Shopify CDN + /products.json confirmed' : 'Shopify CDN detected' };
+        }
+        // WooCommerce signatures
+        if (/wp-content|woocommerce|\/wp-json\//i.test(html)) {
+            return { mode: 'woocommerce', confidence: 'high', reason: 'WordPress/WooCommerce detected in page source' };
+        }
+        // BigCommerce
+        if (/cdn\.bigcommerce\.com|BCData|bigcommerce/i.test(html)) {
+            return { mode: 'generic', confidence: 'medium', reason: 'BigCommerce detected (not natively supported — try Generic)' };
+        }
+    }
+
+    // --- Phase 2: probe JSON endpoints directly ---
+    if (!directBlocked) {
+        const shopifyOk = await probeShopifyEndpoints(origin);
+        if (shopifyOk) {
+            const mode = isSubPath ? 'shopify_collection' : 'shopify';
+            return { mode, confidence: 'high', reason: 'Shopify /products.json endpoint confirmed' };
+        }
+        const wooOk = await probeWooEndpoint(origin);
+        if (wooOk) {
+            return { mode: 'woocommerce', confidence: 'high', reason: 'WooCommerce Store API confirmed' };
+        }
+    }
+
+    // --- Phase 3: browser-based detection (Cloudflare bypass) ---
+    return await detectWithBrowser(rawUrl, origin, isSubPath, logger);
+}
+
+async function probeShopifyEndpoints(origin) {
+    try {
+        const res = await axios.get(`${origin}/products.json?limit=1`, { headers: { 'User-Agent': UA }, timeout: 6000 });
+        return Array.isArray(res.data?.products);
+    } catch { return false; }
+}
+
+async function probeWooEndpoint(origin) {
+    try {
+        const res = await axios.get(`${origin}/wp-json/wc/store/v1/products?per_page=1`, { headers: { 'User-Agent': UA }, timeout: 6000 });
+        return Array.isArray(res.data);
+    } catch { return false; }
+}
+
+async function detectWithBrowser(rawUrl, origin, isSubPath, logger) {
+    let chromium;
+    try { ({ chromium } = require('playwright')); }
+    catch {
+        return { mode: 'shopify_browser', confidence: 'low', reason: 'Playwright not installed — defaulting to Shopify Browser mode' };
+    }
+
+    logger('  -> Launching browser for detection...');
+    const headless = process.env.SHOPIFY_BROWSER_HEADLESS === 'true';
+    const browser = await chromium.launch({ headless });
+    const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1366, height: 768 }, locale: 'en-US' });
+
+    try {
+        const page = await ctx.newPage();
+        await page.goto(rawUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForFunction(() => !/just a moment/i.test(document.title), { timeout: 25000 });
+        await page.waitForTimeout(1500);
+
+        // Detect platform from page source inside browser
+        const platformHint = await page.evaluate(() => {
+            const html = document.documentElement.innerHTML;
+            if (/cdn\.shopify\.com|Shopify\.theme|myshopify\.com/i.test(html) || window.Shopify) return 'shopify';
+            if (/wp-content|woocommerce/i.test(html)) return 'woocommerce';
+            if (/cdn\.bigcommerce\.com|BCData/i.test(html)) return 'bigcommerce';
+            return 'unknown';
+        });
+
+        // Confirm Shopify by probing /products.json from inside the browser session
+        const shopifyConfirmed = await page.evaluate(async (url) => {
+            try {
+                const r = await fetch(url);
+                if (!r.ok) return false;
+                const d = await r.json();
+                return Array.isArray(d.products);
+            } catch { return false; }
+        }, `${origin}/products.json?limit=1`);
+
+        if (shopifyConfirmed) {
+            const mode = isSubPath ? 'shopify_browser_collection' : 'shopify_browser';
+            return { mode, confidence: 'high', reason: 'Cloudflare-protected Shopify — /products.json confirmed via browser' };
+        }
+
+        // Confirm WooCommerce from inside browser
+        const wooConfirmed = await page.evaluate(async (url) => {
+            try {
+                const r = await fetch(url);
+                if (!r.ok) return false;
+                const d = await r.json();
+                return Array.isArray(d);
+            } catch { return false; }
+        }, `${origin}/wp-json/wc/store/v1/products?per_page=1`);
+
+        if (wooConfirmed) {
+            return { mode: 'woocommerce', confidence: 'high', reason: 'Cloudflare-protected WooCommerce — Store API confirmed via browser' };
+        }
+
+        if (platformHint === 'bigcommerce') {
+            return { mode: 'generic', confidence: 'medium', reason: 'BigCommerce detected via browser (not natively supported)' };
+        }
+
+        return { mode: 'shopify_browser', confidence: 'low', reason: `Unknown platform (hint: ${platformHint}) — try Shopify Browser mode` };
+    } catch (err) {
+        return { mode: 'shopify_browser', confidence: 'low', reason: `Browser detection failed: ${err.message}` };
+    } finally {
+        await browser.close();
+    }
+}
+
+module.exports = { scrapeShopifyStore, detectPlatform };

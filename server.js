@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const { scrapeShopifyStore } = require('./index');
+const { scrapeShopifyStore, detectPlatform } = require('./index');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -73,6 +73,20 @@ app.post('/api/scrape', async (req, res) => {
         lastResult = { success: false, error: err.message };
     } finally {
         isScraping = false;
+    }
+});
+
+app.post('/api/detect', async (req, res) => {
+    const { url } = req.body;
+    if (!url || typeof url !== 'string') return res.status(400).json({ error: 'URL is required' });
+    if (!isValidUrl(url)) return res.status(400).json({ error: 'Invalid or disallowed URL' });
+
+    const logs = [];
+    try {
+        const result = await detectPlatform(url, msg => { logs.push(msg); console.log(msg); });
+        res.json({ ...result, logs });
+    } catch (err) {
+        res.status(500).json({ error: err.message, logs });
     }
 });
 

@@ -1,4 +1,6 @@
 const scrapeBtn = document.getElementById('scrape-btn');
+const detectBtn = document.getElementById('detect-btn');
+const detectResult = document.getElementById('detect-result');
 const storeUrlInput = document.getElementById('store-url');
 const statusCard = document.getElementById('status-card');
 const logViewer = document.getElementById('log-viewer');
@@ -23,6 +25,50 @@ function toggleMaxPagesVisibility() {
 }
 platformMode.addEventListener('change', toggleMaxPagesVisibility);
 toggleMaxPagesVisibility();
+
+detectBtn.addEventListener('click', async () => {
+    const url = storeUrlInput.value.trim();
+    if (!url) return alert('Please enter a URL first');
+
+    const dBtnText = detectBtn.querySelector('.btn-text');
+    const dLoader = detectBtn.querySelector('.loader');
+    dBtnText.classList.add('hidden');
+    dLoader.classList.remove('hidden');
+    detectBtn.disabled = true;
+    scrapeBtn.disabled = true;
+    detectResult.className = 'hint';
+    detectResult.textContent = 'Detecting platform...';
+
+    try {
+        const res = await fetch('/api/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
+        });
+        const data = await res.json();
+
+        if (data.mode) {
+            platformMode.value = data.mode;
+            toggleMaxPagesVisibility();
+            const badge = data.confidence === 'high' ? '✓' : data.confidence === 'medium' ? '~' : '?';
+            detectResult.textContent = `${badge} Detected: ${platformMode.options[platformMode.selectedIndex].text} — ${data.reason}`;
+            detectResult.style.color = data.confidence === 'high' ? '#34d399' : data.confidence === 'medium' ? '#fbbf24' : '#f87171';
+        } else {
+            detectResult.textContent = `Could not detect platform: ${data.reason || data.error}`;
+            detectResult.style.color = '#f87171';
+        }
+        detectResult.classList.remove('hidden');
+    } catch (err) {
+        detectResult.textContent = `Detection error: ${err.message}`;
+        detectResult.style.color = '#f87171';
+        detectResult.classList.remove('hidden');
+    } finally {
+        dBtnText.classList.remove('hidden');
+        dLoader.classList.add('hidden');
+        detectBtn.disabled = false;
+        scrapeBtn.disabled = false;
+    }
+});
 
 let pollInterval = null;
 

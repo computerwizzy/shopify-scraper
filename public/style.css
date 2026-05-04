@@ -83,6 +83,25 @@ body {
 }
 .input-group input:focus { outline: none; border-color: #a78bfa; }
 
+#detect-btn {
+    padding: 14px 18px;
+    background: rgba(255, 255, 255, 0.06);
+    color: #c4b5fd;
+    border: 1px solid rgba(167, 139, 250, 0.35);
+    border-radius: 10px;
+    font-family: inherit;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: background 0.15s ease;
+    white-space: nowrap;
+}
+#detect-btn:hover:not(:disabled) { background: rgba(167, 139, 250, 0.15); }
+#detect-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 #scrape-btn {
     padding: 14px 24px;
     background: linear-gradient(135deg, #7c3aed, #2563eb);
